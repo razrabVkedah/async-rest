@@ -41,6 +41,7 @@ public final class TaskService {
             task.markFailed("Rejected: queue full");
             metrics.markTaskRejected();
         }
+        System.out.println(id);
         return id;
     }
 

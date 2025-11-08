@@ -11,4 +11,12 @@ public final class Strings {
             return def;
         }
     }
+
+    public static int parseIntOr(String s, int def) {
+        try {
+            return Integer.parseInt(s);
+        } catch (Exception e) {
+            return def;
+        }
+    }
 }

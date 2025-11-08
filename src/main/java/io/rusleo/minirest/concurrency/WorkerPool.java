@@ -10,8 +10,8 @@ public final class WorkerPool {
 
     public static ThreadPoolExecutor createDefault(MetricsRegistry metrics) {
         int cores = Math.max(2, Runtime.getRuntime().availableProcessors());
-        int core = Math.min(cores, 4);
-        int max = Math.max(core, cores * 4);
+        int core = Math.max(4, cores);
+        int max  = cores * 8;
 
         BlockingQueue<Runnable> queue = new ArrayBlockingQueue<>(1024);
 
@@ -22,7 +22,6 @@ public final class WorkerPool {
         };
 
         RejectedExecutionHandler rejection = (r, ex) -> {
-            // Учёт отказов как перегрузка — метрика (не HTTP-ответ).
             metrics.markTaskRejected();
             throw new RejectedExecutionException("Worker queue full");
         };

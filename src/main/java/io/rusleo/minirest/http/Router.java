@@ -6,8 +6,6 @@ import io.rusleo.minirest.metrics.MetricsRegistry;
 
 import java.io.IOException;
 import java.util.*;
-import java.util.concurrent.Executor;
-import java.util.concurrent.ThreadPoolExecutor;
 
 import static io.rusleo.minirest.http.HttpExchangeHelper.*;
 
@@ -25,11 +23,9 @@ public final class Router implements HttpHandler {
     }
 
     private final List<Entry> routes = new ArrayList<>();
-    private final ThreadPoolExecutor worker;
     private final MetricsRegistry metrics;
 
-    public Router(ThreadPoolExecutor worker, MetricsRegistry metrics) {
-        this.worker = worker;
+    public Router(MetricsRegistry metrics) {
         this.metrics = metrics;
     }
 
@@ -50,6 +46,7 @@ public final class Router implements HttpHandler {
             sendPlain(ex, 405, "Method Not Allowed");
             return;
         }
+
         String path = ex.getRequestURI().getPath();
         Entry match = null;
         Map<String, String> pathParams = null;
@@ -69,28 +66,17 @@ public final class Router implements HttpHandler {
             return;
         }
 
-        final long start = System.nanoTime();
+        long start = System.nanoTime();
         metrics.incHttpInFlight();
-
-        final Entry routeMatch = match;
-        final Map<String, String> routeParams = pathParams;
-        final HttpExchange exchange = ex;
-        final long startTime = start;
-
         try {
-            worker.execute(() -> {
-                try {
-                    routeMatch.route.handle(exchange, routeParams);
-                    metrics.markHttpCompleted(System.nanoTime() - startTime);
-                } catch (Throwable t) {
-                    safeSendError(exchange, t);
-                } finally {
-                    metrics.decHttpInFlight();
-                }
-            });
-        } catch (RuntimeException rejected) {
+            // ВАЖНО: выполняем хендлер СИНХРОННО в том потоке,
+            // который выделил HttpServer из своего executor’а.
+            match.route.handle(ex, pathParams);
+            metrics.markHttpCompleted(System.nanoTime() - start);
+        } catch (Throwable t) {
+            safeSendError(ex, t);
+        } finally {
             metrics.decHttpInFlight();
-            sendPlain(ex, 429, "Too Many Requests");
         }
     }
 }
