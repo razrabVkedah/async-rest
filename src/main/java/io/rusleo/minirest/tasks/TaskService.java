@@ -1,22 +1,34 @@
 package io.rusleo.minirest.tasks;
 
+import io.rusleo.minirest.concurrency.TaskExecutor;
 import io.rusleo.minirest.metrics.MetricsRegistry;
 
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.RejectedExecutionException;
 
+/**
+ * Сервис управления задачами.
+ * Не зависит от конкретной реализации пула потоков, работает через TaskExecutor.
+ */
 public final class TaskService {
-    private final ThreadPoolExecutor worker;
+    private final TaskExecutor worker;
     private final MetricsRegistry metrics;
     private final ConcurrentMap<String, Task> tasks = new ConcurrentHashMap<>();
 
-    public TaskService(ThreadPoolExecutor worker, MetricsRegistry metrics) {
+    public TaskService(TaskExecutor worker, MetricsRegistry metrics) {
         this.worker = worker;
         this.metrics = metrics;
     }
 
+    /**
+     * Создаёт задачу типа "delay" с задержкой millis.
+     * Возвращает ID задачи (даже если очередь была переполнена —
+     * в этом случае статус будет FAILED и error = "Rejected: queue full").
+     */
     public String submitDelay(long millis) {
         String id = UUID.randomUUID().toString();
         Task task = new Task(id, "delay");
@@ -38,10 +50,11 @@ public final class TaskService {
                 }
             });
         } catch (RejectedExecutionException rex) {
+            // Очередь пула переполнена — помечаем задачу как проваленную.
             task.markFailed("Rejected: queue full");
             metrics.markTaskRejected();
         }
-        System.out.println(id);
+
         return id;
     }
 

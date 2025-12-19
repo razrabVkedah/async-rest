@@ -1,31 +1,40 @@
 package io.rusleo.minirest.concurrency;
 
-import io.rusleo.minirest.metrics.MetricsRegistry;
-
 import java.util.concurrent.*;
 
+/**
+ * Фабрика дефолтного пула рабочих потоков для фоновых задач.
+ */
 public final class WorkerPool {
     private WorkerPool() {
     }
 
-    public static ThreadPoolExecutor createDefault(MetricsRegistry metrics) {
+    /**
+     * Создаёт дефолтный TaskExecutor для фоновых задач.
+     */
+    public static TaskExecutor createDefault() {
         int cores = Math.max(2, Runtime.getRuntime().availableProcessors());
         int core = Math.max(4, cores);
         int max  = cores * 8;
 
         BlockingQueue<Runnable> queue = new ArrayBlockingQueue<>(1024);
 
-        ThreadFactory tf = r -> {
-            Thread t = new Thread(r, "worker-" + System.nanoTime());
-            t.setDaemon(true);
-            return t;
-        };
+        ThreadFactory tf = r -> new Thread(r, "worker-" + System.nanoTime());
 
         RejectedExecutionHandler rejection = (r, ex) -> {
-            metrics.markTaskRejected();
             throw new RejectedExecutionException("Worker queue full");
         };
 
-        return new ThreadPoolExecutor(core, max, 60, TimeUnit.SECONDS, queue, tf, rejection);
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(
+                core,
+                max,
+                60,
+                TimeUnit.SECONDS,
+                queue,
+                tf,
+                rejection
+        );
+
+        return new PooledTaskExecutor(executor);
     }
 }

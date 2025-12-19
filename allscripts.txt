@@ -1,0 +1,1008 @@
+package io.rusleo.minirest.metrics;
+
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
+
+public final class MetricsRegistry {
+    // HTTP
+    private final AtomicInteger httpInFlight = new AtomicInteger(0);
+    private final LongAdder httpCompleted = new LongAdder();
+    private final LongAdder httpTotalLatencyNanos = new LongAdder();
+
+    // Tasks
+    private final AtomicInteger tasksRunning = new AtomicInteger(0);
+    private final LongAdder tasksCompleted = new LongAdder();
+    private final LongAdder tasksFailed = new LongAdder();
+    private final LongAdder tasksRejected = new LongAdder();
+
+    // --- HTTP ---
+    public void incHttpInFlight() {
+        httpInFlight.incrementAndGet();
+    }
+
+    public void decHttpInFlight() {
+        httpInFlight.decrementAndGet();
+    }
+
+    public void markHttpCompleted(long latencyNs) {
+        httpCompleted.increment();
+        httpTotalLatencyNanos.add(latencyNs);
+    }
+
+    public int getHttpInFlight() {
+        return httpInFlight.get();
+    }
+
+    public long getHttpCompleted() {
+        return httpCompleted.sum();
+    }
+
+    public long getHttpAvgLatencyMs() {
+        long comp = httpCompleted.sum();
+        return comp == 0 ? 0 : (httpTotalLatencyNanos.sum() / comp) / 1_000_000L;
+    }
+
+    // --- Tasks ---
+    public void incTasksRunning() {
+        tasksRunning.incrementAndGet();
+    }
+
+    public void decTasksRunning() {
+        tasksRunning.decrementAndGet();
+    }
+
+    public void markTaskCompleted() {
+        tasksCompleted.increment();
+    }
+
+    public void markTaskFailed() {
+        tasksFailed.increment();
+    }
+
+    public void markTaskRejected() {
+        tasksRejected.increment();
+    }
+
+    public int getTasksRunning() {
+        return tasksRunning.get();
+    }
+
+    public long getTasksCompleted() {
+        return tasksCompleted.sum();
+    }
+
+    public long getTasksFailed() {
+        return tasksFailed.sum();
+    }
+
+    public long getTasksRejected() {
+        return tasksRejected.sum();
+    }
+}
+package io.rusleo.minirest.tasks;
+
+public enum TaskStatus {SUBMITTED, RUNNING, COMPLETED, FAILED}
+package io.rusleo.minirest.tasks;
+
+import java.time.Instant;
+import java.util.Objects;
+
+public final class Task {
+    private final String id;
+    private final String type;
+    private final long createdAtEpochMs;
+
+    private volatile TaskStatus status = TaskStatus.SUBMITTED;
+    private volatile Long startedAtEpochMs;
+    private volatile Long finishedAtEpochMs;
+    private volatile String error;
+
+    public Task(String id, String type) {
+        this.id = Objects.requireNonNull(id);
+        this.type = Objects.requireNonNull(type);
+        this.createdAtEpochMs = Instant.now().toEpochMilli();
+    }
+
+    public String id() {
+        return id;
+    }
+
+    public String type() {
+        return type;
+    }
+
+    public TaskStatus status() {
+        return status;
+    }
+
+    public long createdAtEpochMs() {
+        return createdAtEpochMs;
+    }
+
+    public Long startedAtEpochMs() {
+        return startedAtEpochMs;
+    }
+
+    public Long finishedAtEpochMs() {
+        return finishedAtEpochMs;
+    }
+
+    public String error() {
+        return error;
+    }
+
+    public void markRunning() {
+        status = TaskStatus.RUNNING;
+        startedAtEpochMs = Instant.now().toEpochMilli();
+    }
+
+    public void markCompleted() {
+        status = TaskStatus.COMPLETED;
+        finishedAtEpochMs = Instant.now().toEpochMilli();
+    }
+
+    public void markFailed(String err) {
+        status = TaskStatus.FAILED;
+        finishedAtEpochMs = Instant.now().toEpochMilli();
+        error = err;
+    }
+}
+package io.rusleo.minirest.tasks;
+
+import io.rusleo.minirest.concurrency.TaskExecutor;
+import io.rusleo.minirest.metrics.MetricsRegistry;
+
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.RejectedExecutionException;
+
+/**
+ * Сервис управления задачами.
+ * Не зависит от конкретной реализации пула потоков, работает через TaskExecutor.
+ */
+public final class TaskService {
+    private final TaskExecutor worker;
+    private final MetricsRegistry metrics;
+    private final ConcurrentMap<String, Task> tasks = new ConcurrentHashMap<>();
+
+    public TaskService(TaskExecutor worker, MetricsRegistry metrics) {
+        this.worker = worker;
+        this.metrics = metrics;
+    }
+
+    /**
+     * Создаёт задачу типа "delay" с задержкой millis.
+     * Возвращает ID задачи (даже если очередь была переполнена —
+     * в этом случае статус будет FAILED и error = "Rejected: queue full").
+     */
+    public String submitDelay(long millis) {
+        String id = UUID.randomUUID().toString();
+        Task task = new Task(id, "delay");
+        tasks.put(id, task);
+
+        try {
+            worker.execute(() -> {
+                metrics.incTasksRunning();
+                try {
+                    task.markRunning();
+                    Thread.sleep(Math.max(0, millis));
+                    task.markCompleted();
+                    metrics.markTaskCompleted();
+                } catch (Throwable t) {
+                    task.markFailed(t.getClass().getSimpleName() + ": " + t.getMessage());
+                    metrics.markTaskFailed();
+                } finally {
+                    metrics.decTasksRunning();
+                }
+            });
+        } catch (RejectedExecutionException rex) {
+            // Очередь пула переполнена — помечаем задачу как проваленную.
+            task.markFailed("Rejected: queue full");
+            metrics.markTaskRejected();
+        }
+
+        // Убрал System.out.println(id); — это должен решать вызывающий код, логировать ID или нет.
+        return id;
+    }
+
+    public Optional<Task> get(String id) {
+        return Optional.ofNullable(tasks.get(id));
+    }
+
+    public Map<String, Task> snapshotAll() {
+        return Map.copyOf(tasks);
+    }
+}
+package io.rusleo.minirest.core;
+
+import io.rusleo.minirest.concurrency.TaskExecutor;
+import io.rusleo.minirest.concurrency.WorkerPool;
+import io.rusleo.minirest.http.Router;
+import io.rusleo.minirest.http.SimpleHttpServer;
+import io.rusleo.minirest.http.handlers.*;
+import io.rusleo.minirest.metrics.MetricsRegistry;
+import io.rusleo.minirest.tasks.TaskService;
+
+import java.net.InetSocketAddress;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+
+/**
+ * Точка входа приложения и "composition root":
+ * здесь мы собираем все зависимости и запускаем HTTP-сервер.
+ */
+public final class Application {
+
+    public static void main(String[] args) throws Exception {
+        MetricsRegistry metrics = new MetricsRegistry();
+
+        // 1) Пул для фоновых задач (delay и т.п.)
+        TaskExecutor taskExecutor = WorkerPool.createDefault();
+
+        // 2) Отдельный пул потоков для HTTP-обработчиков.
+        ThreadFactory httpTf = r -> {
+            Thread t = new Thread(r, "http-handler");
+            t.setDaemon(true);
+            return t;
+        };
+
+        // кэшированный пул для HTTP.
+        ExecutorService httpExecutor = Executors.newCachedThreadPool(httpTf);
+
+        TaskService tasks = new TaskService(taskExecutor, metrics);
+
+        Router router = new Router(metrics);
+        router.get("/health", new HealthHandler());
+        router.get("/metrics", new MetricsHandler(taskExecutor, metrics, tasks));
+        router.get("/tasks/status", new TasksStatusHandler(tasks));
+        router.get("/tasks/{id}", new TaskByIdHandler(tasks));
+        router.post("/tasks/submit", new TasksSubmitHandler(tasks));
+        router.post("/tasks/many", new ManyTasksSubmitHandler(tasks));
+
+        SimpleHttpServer server = new SimpleHttpServer(
+                new InetSocketAddress("0.0.0.0", 8080),
+                httpExecutor,
+                router
+        );
+
+        // Небольшой хук для аккуратной остановки
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            server.stop(1);
+            taskExecutor.shutdown();
+            httpExecutor.shutdown();
+        }, "shutdown-hook"));
+
+        server.start();
+        System.out.println("Server started on http://0.0.0.0:8080");
+    }
+}
+package io.rusleo.minirest.util;
+
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+
+public final class QueryParams {
+    private QueryParams() {
+    }
+
+    public static Map<String, String> parse(String raw) {
+        if (raw == null || raw.isEmpty()) return Map.of();
+        Map<String, String> m = new LinkedHashMap<>();
+        for (String p : raw.split("&")) {
+            int i = p.indexOf('=');
+            if (i >= 0) {
+                String k = urlDecode(p.substring(0, i));
+                String v = urlDecode(p.substring(i + 1));
+                m.put(k, v);
+            } else {
+                m.put(urlDecode(p), "");
+            }
+        }
+        return m;
+    }
+
+    private static String urlDecode(String s) {
+        return URLDecoder.decode(s, StandardCharsets.UTF_8);
+    }
+}
+package io.rusleo.minirest.util;
+
+public final class Json {
+    private Json() {
+    }
+
+    public static String esc(String s) {
+        if (s == null) return "null";
+        StringBuilder sb = new StringBuilder("\"");
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"' -> sb.append("\\\"");
+                case '\\' -> sb.append("\\\\");
+                case '\n' -> sb.append("\\n");
+                case '\r' -> sb.append("\\r");
+                case '\t' -> sb.append("\\t");
+                default -> {
+                    if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
+                    else sb.append(c);
+                }
+            }
+        }
+        sb.append('"');
+        return sb.toString();
+    }
+}
+package io.rusleo.minirest.util;
+
+public final class Strings {
+    private Strings() {
+    }
+
+    public static long parseLongOr(String s, long def) {
+        try {
+            return Long.parseLong(s);
+        } catch (Exception e) {
+            return def;
+        }
+    }
+
+    public static int parseIntOr(String s, int def) {
+        try {
+            return Integer.parseInt(s);
+        } catch (Exception e) {
+            return def;
+        }
+    }
+}
+package io.rusleo.minirest.concurrency;
+
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+
+/**
+ * Обёртка над ThreadPoolExecutor, реализующая TaskExecutor.
+ * Снаружи виден только интерфейс + агрегированная статистика.
+ */
+public final class PooledTaskExecutor implements TaskExecutor {
+
+    private final ThreadPoolExecutor executor;
+
+    public PooledTaskExecutor(ThreadPoolExecutor executor) {
+        this.executor = executor;
+    }
+
+    @Override
+    public void execute(Runnable command) {
+        // Может бросить RejectedExecutionException — вызывающая сторона решает,
+        // как это логировать и считать метрики.
+        executor.execute(command);
+    }
+
+    @Override
+    public WorkerStats stats() {
+        return new WorkerStats(
+                executor.getCorePoolSize(),
+                executor.getMaximumPoolSize(),
+                executor.getActiveCount(),
+                executor.getQueue().size(),
+                executor.getCompletedTaskCount()
+        );
+    }
+
+    @Override
+    public void shutdown() {
+        executor.shutdown();
+    }
+
+    /**
+     * Опционально: если нужно где-то получить "сырой" executor
+     * (например, для тонкой настройки или graceful shutdown).
+     */
+    public ExecutorService rawExecutor() {
+        return executor;
+    }
+}
+package io.rusleo.minirest.concurrency;
+
+/**
+ * Абстракция над исполнителем фоновых задач.
+ * Позволяет скрыть конкретную реализацию (ThreadPoolExecutor)
+ * и даёт агрегированную статистику по пулу.
+ */
+public interface TaskExecutor {
+
+    /**
+     * Отправить задачу на выполнение.
+     */
+    void execute(Runnable command);
+
+    /**
+     * Снять срез статистики по пулу.
+     */
+    WorkerStats stats();
+
+    /**
+     * Корректно остановить пул.
+     */
+    void shutdown();
+}
+package io.rusleo.minirest.concurrency;
+
+/**
+ * Небольшой immutable-объект со статистикой по пулу задач.
+ */
+public final class WorkerStats {
+    private final int corePoolSize;
+    private final int maximumPoolSize;
+    private final int activeCount;
+    private final int queueSize;
+    private final long completedTaskCount;
+
+    public WorkerStats(int corePoolSize,
+                       int maximumPoolSize,
+                       int activeCount,
+                       int queueSize,
+                       long completedTaskCount) {
+        this.corePoolSize = corePoolSize;
+        this.maximumPoolSize = maximumPoolSize;
+        this.activeCount = activeCount;
+        this.queueSize = queueSize;
+        this.completedTaskCount = completedTaskCount;
+    }
+
+    public int getCorePoolSize() {
+        return corePoolSize;
+    }
+
+    public int getMaximumPoolSize() {
+        return maximumPoolSize;
+    }
+
+    public int getActiveCount() {
+        return activeCount;
+    }
+
+    public int getQueueSize() {
+        return queueSize;
+    }
+
+    public long getCompletedTaskCount() {
+        return completedTaskCount;
+    }
+}
+package io.rusleo.minirest.concurrency;
+
+import java.util.concurrent.*;
+
+/**
+ * Фабрика дефолтного пула рабочих потоков для фоновых задач.
+ * Больше не знает ничего про метрики — только про конфигурацию пула.
+ */
+public final class WorkerPool {
+    private WorkerPool() {
+    }
+
+    /**
+     * Создаёт дефолтный TaskExecutor для фоновых задач.
+     */
+    public static TaskExecutor createDefault() {
+        int cores = Math.max(2, Runtime.getRuntime().availableProcessors());
+        int core = Math.max(4, cores);
+        int max  = cores * 8;
+
+        BlockingQueue<Runnable> queue = new ArrayBlockingQueue<>(1024);
+
+        ThreadFactory tf = r -> {
+            Thread t = new Thread(r, "worker-" + System.nanoTime());
+            t.setDaemon(true);
+            return t;
+        };
+
+        RejectedExecutionHandler rejection = (r, ex) -> {
+            // Никаких метрик здесь — только сигнал наверх,
+            // что очередь переполнена.
+            throw new RejectedExecutionException("Worker queue full");
+        };
+
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(
+                core,
+                max,
+                60,
+                TimeUnit.SECONDS,
+                queue,
+                tf,
+                rejection
+        );
+
+        return new PooledTaskExecutor(executor);
+    }
+}
+package io.rusleo.minirest.http;
+
+import java.util.*;
+
+public final class PathPattern {
+    private final String pattern;
+    private final String[] segments;
+    private final boolean[] isVar;
+    private final String[] varNames;
+
+    public PathPattern(String pattern) {
+        if (!pattern.startsWith("/")) throw new IllegalArgumentException("Pattern must start with /");
+        this.pattern = pattern;
+        this.segments = pattern.split("/");
+        this.isVar = new boolean[segments.length];
+        this.varNames = new String[segments.length];
+        for (int i = 0; i < segments.length; i++) {
+            String s = segments[i];
+            if (s.startsWith("{") && s.endsWith("}") && s.length() > 2) {
+                isVar[i] = true;
+                varNames[i] = s.substring(1, s.length() - 1);
+            }
+        }
+    }
+
+    public Map<String, String> match(String path) {
+        String[] parts = path.split("/");
+        if (parts.length != segments.length) return null;
+        Map<String, String> result = new HashMap<>();
+        for (int i = 0; i < segments.length; i++) {
+            String seg = segments[i];
+            String got = parts[i];
+            if (seg.isEmpty() && got.isEmpty()) continue;
+            if (isVar[i]) {
+                result.put(varNames[i], got);
+            } else if (!seg.equals(got)) {
+                return null;
+            }
+        }
+        return result;
+    }
+
+    @Override
+    public String toString() {
+        return pattern;
+    }
+}
+package io.rusleo.minirest.http;
+
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpHandler;
+import io.rusleo.minirest.metrics.MetricsRegistry;
+
+import java.io.IOException;
+import java.util.*;
+
+import static io.rusleo.minirest.http.HttpExchangeHelper.*;
+
+public final class Router implements HttpHandler {
+    private static final class Entry {
+        final HttpMethod method;
+        final PathPattern pattern;
+        final Route route;
+
+        Entry(HttpMethod m, String p, Route r) {
+            this.method = m;
+            this.pattern = new PathPattern(p);
+            this.route = r;
+        }
+    }
+
+    private final List<Entry> routes = new ArrayList<>();
+    private final MetricsRegistry metrics;
+
+    public Router(MetricsRegistry metrics) {
+        this.metrics = metrics;
+    }
+
+    public Router get(String path, Route route) {
+        routes.add(new Entry(HttpMethod.GET, path, route));
+        return this;
+    }
+
+    public Router post(String path, Route route) {
+        routes.add(new Entry(HttpMethod.POST, path, route));
+        return this;
+    }
+
+    @Override
+    public void handle(HttpExchange ex) throws IOException {
+        HttpMethod method = HttpMethod.from(ex.getRequestMethod());
+        if (method == null) {
+            sendPlain(ex, 405, "Method Not Allowed");
+            return;
+        }
+
+        String path = ex.getRequestURI().getPath();
+        Entry match = null;
+        Map<String, String> pathParams = null;
+
+        for (Entry e : routes) {
+            if (e.method != method) continue;
+            Map<String, String> params = e.pattern.match(path);
+            if (params != null) {
+                match = e;
+                pathParams = params;
+                break;
+            }
+        }
+
+        if (match == null) {
+            sendPlain(ex, 404, "Not Found");
+            return;
+        }
+
+        long start = System.nanoTime();
+        metrics.incHttpInFlight();
+        try {
+            // ВАЖНО: выполняем хендлер СИНХРОННО в том потоке,
+            // который выделил HttpServer из своего executor’а.
+            match.route.handle(ex, pathParams);
+            metrics.markHttpCompleted(System.nanoTime() - start);
+        } catch (Throwable t) {
+            safeSendError(ex, t);
+        } finally {
+            metrics.decHttpInFlight();
+        }
+    }
+}
+package io.rusleo.minirest.http;
+
+import com.sun.net.httpserver.HttpExchange;
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+
+public final class HttpExchangeHelper {
+    private HttpExchangeHelper() {
+    }
+
+    public static void sendPlain(HttpExchange ex, int code, String text) {
+        sendBytes(ex, code, "text/plain; charset=utf-8", text.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public static void sendJson(HttpExchange ex, int code, String json) {
+        sendBytes(ex, code, "application/json; charset=utf-8", json.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public static void safeSendError(HttpExchange ex, Throwable t) {
+        try {
+            String msg = t.getMessage() == null ? "" : t.getMessage().replace("\"", "'");
+            sendJson(ex, 500, "{\"error\":\"" + t.getClass().getSimpleName() + "\",\"message\":\"" + msg + "\"}");
+        } catch (Exception ignored) {
+        }
+    }
+
+    public static String readBodyAsString(HttpExchange ex, int maxBytes) throws IOException {
+        try (InputStream is = ex.getRequestBody()) {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int r, total = 0;
+            while ((r = is.read(buf)) != -1) {
+                total += r;
+                if (total > maxBytes) throw new IOException("Request body too large");
+                bos.write(buf, 0, r);
+            }
+            return bos.toString(StandardCharsets.UTF_8);
+        }
+    }
+
+    private static void sendBytes(HttpExchange ex, int code, String contentType, byte[] data) {
+        try {
+            ex.getResponseHeaders().set("Content-Type", contentType);
+            ex.sendResponseHeaders(code, data.length);
+            try (OutputStream os = ex.getResponseBody()) {
+                os.write(data);
+            }
+        } catch (IOException ignored) {
+        } finally {
+            try {
+                ex.close();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+}
+package io.rusleo.minirest.http;
+
+import com.sun.net.httpserver.HttpExchange;
+
+import java.io.IOException;
+import java.util.Map;
+
+@FunctionalInterface
+public interface Route {
+    void handle(HttpExchange exchange, Map<String, String> pathParams) throws IOException;
+}
+package io.rusleo.minirest.http;
+
+public enum HttpMethod {
+    GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD;
+
+    public static HttpMethod from(String s) {
+        try {
+            return HttpMethod.valueOf(s.toUpperCase());
+        } catch (Exception e) {
+            return null;
+        }
+    }
+}
+package io.rusleo.minirest.http;
+
+import com.sun.net.httpserver.HttpServer;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.util.concurrent.Executor;
+
+public final class SimpleHttpServer {
+    private final HttpServer server;
+
+    public SimpleHttpServer(InetSocketAddress address, Executor httpExecutor, Router router) throws IOException {
+        this.server = HttpServer.create(address, 0);
+        this.server.setExecutor(httpExecutor);
+        // Один общий контекст на "/": дальше роутинг берёт на себя Router
+        this.server.createContext("/", router);
+    }
+
+    public void start() {
+        server.start();
+    }
+
+    public void stop(int delaySeconds) {
+        server.stop(delaySeconds);
+    }
+}
+package io.rusleo.minirest.http.handlers;
+
+import com.sun.net.httpserver.HttpExchange;
+import io.rusleo.minirest.http.Route;
+
+import static io.rusleo.minirest.http.HttpExchangeHelper.sendJson;
+
+import java.io.IOException;
+import java.util.Map;
+
+public final class HealthHandler implements Route {
+    @Override
+    public void handle(HttpExchange exchange, Map<String, String> pathParams) throws IOException {
+        sendJson(exchange, 200, "{\"status\":\"ok\"}");
+    }
+}
+package io.rusleo.minirest.http.handlers;
+
+import com.sun.net.httpserver.HttpExchange;
+import io.rusleo.minirest.concurrency.TaskExecutor;
+import io.rusleo.minirest.concurrency.WorkerStats;
+import io.rusleo.minirest.http.Route;
+import io.rusleo.minirest.metrics.MetricsRegistry;
+import io.rusleo.minirest.tasks.TaskService;
+
+import java.io.IOException;
+import java.util.Map;
+
+import static io.rusleo.minirest.http.HttpExchangeHelper.sendJson;
+
+/**
+ * HTTP-эндпоинт для просмотра метрик по HTTP и фоновой очереди задач.
+ */
+public final class MetricsHandler implements Route {
+    private final TaskExecutor taskExecutor;
+    private final MetricsRegistry metrics;
+    private final TaskService tasks;
+
+    public MetricsHandler(TaskExecutor taskExecutor, MetricsRegistry metrics, TaskService tasks) {
+        this.taskExecutor = taskExecutor;
+        this.metrics = metrics;
+        this.tasks = tasks;
+    }
+
+    @Override
+    public void handle(HttpExchange exchange, Map<String, String> pathParams) throws IOException {
+        WorkerStats ws = taskExecutor.stats();
+
+        String json = "{"
+                + "\"http\":{"
+                + "\"in_flight\":" + metrics.getHttpInFlight() + ","
+                + "\"completed\":" + metrics.getHttpCompleted() + ","
+                + "\"avg_latency_ms\":" + metrics.getHttpAvgLatencyMs()
+                + "},"
+                + "\"worker\":{"
+                + "\"core\":" + ws.getCorePoolSize() + ","
+                + "\"max\":" + ws.getMaximumPoolSize() + ","
+                + "\"active\":" + ws.getActiveCount() + ","
+                + "\"queue\":" + ws.getQueueSize() + ","
+                + "\"completed\":" + ws.getCompletedTaskCount()
+                + "},"
+                + "\"tasks\":{"
+                + "\"running\":" + metrics.getTasksRunning() + ","
+                + "\"completed\":" + metrics.getTasksCompleted() + ","
+                + "\"failed\":" + metrics.getTasksFailed() + ","
+                + "\"rejected\":" + metrics.getTasksRejected()
+                + "}"
+                + "}";
+
+        sendJson(exchange, 200, json);
+    }
+}
+package io.rusleo.minirest.http.handlers;
+
+import com.sun.net.httpserver.HttpExchange;
+import io.rusleo.minirest.http.Route;
+import io.rusleo.minirest.util.QueryParams;
+import io.rusleo.minirest.util.Strings;
+
+import java.io.IOException;
+import java.util.Map;
+
+import static io.rusleo.minirest.http.HttpExchangeHelper.sendJson;
+
+public final class ManyTasksSubmitHandler implements Route {
+    private final io.rusleo.minirest.tasks.TaskService tasks;
+
+    public ManyTasksSubmitHandler(io.rusleo.minirest.tasks.TaskService tasks) {
+        this.tasks = tasks;
+    }
+
+    @Override
+    public void handle(HttpExchange exchange, Map<String, String> pathParams) throws IOException {
+        Map<String, String> q = QueryParams.parse(exchange.getRequestURI().getQuery());
+
+        // Параметры: количество задач и диапазон задержек
+        long countLong = Strings.parseLongOr(q.getOrDefault("count", "10"), 10);
+        int count = (int) Math.max(1, Math.min(countLong, 10_000));
+
+        long minMs = Strings.parseLongOr(q.getOrDefault("minMs", "200"), 200);
+        long maxMs = Strings.parseLongOr(q.getOrDefault("maxMs", "2000"), 2000);
+        if (minMs > maxMs) {
+            long tmp = minMs; minMs = maxMs; maxMs = tmp;
+        }
+
+        java.util.concurrent.ThreadLocalRandom rnd = java.util.concurrent.ThreadLocalRandom.current();
+
+        StringBuilder sb = new StringBuilder(128 + count * 64);
+        sb.append('{')
+                .append("\"count\":").append(count).append(',')
+                .append("\"minMs\":").append(minMs).append(',')
+                .append("\"maxMs\":").append(maxMs).append(',')
+                .append("\"tasks\":[");
+
+        for (int i = 0; i < count; i++) {
+            long delay = (minMs == maxMs) ? minMs : rnd.nextLong(minMs, maxMs + 1);
+            String id = tasks.submitDelay(delay);
+
+            if (i > 0) sb.append(',');
+            sb.append('{')
+                    .append("\"taskId\":\"").append(id).append("\",")
+                    .append("\"delayMs\":").append(delay).append(',')
+                    .append("\"statusUrl\":\"/tasks/").append(id).append("\"")
+                    .append('}');
+        }
+        sb.append("]}");
+
+        sendJson(exchange, 202, sb.toString());
+    }
+}
+package io.rusleo.minirest.http.handlers;
+
+import com.sun.net.httpserver.HttpExchange;
+import io.rusleo.minirest.http.Route;
+import io.rusleo.minirest.util.QueryParams;
+import io.rusleo.minirest.util.Strings;
+
+import java.io.IOException;
+import java.util.Map;
+
+import static io.rusleo.minirest.http.HttpExchangeHelper.sendJson;
+
+public final class TasksSubmitHandler implements Route {
+    private final io.rusleo.minirest.tasks.TaskService tasks;
+
+    public TasksSubmitHandler(io.rusleo.minirest.tasks.TaskService tasks) {
+        this.tasks = tasks;
+    }
+
+    @Override
+    public void handle(HttpExchange exchange, Map<String, String> pathParams) throws IOException {
+        Map<String, String> q = QueryParams.parse(exchange.getRequestURI().getQuery());
+        String type = q.getOrDefault("type", "delay");
+        if (!"delay".equals(type)) {
+            sendJson(exchange, 400, "{\"error\":\"unsupported_type\"}");
+            return;
+        }
+        long ms = Strings.parseLongOr(q.getOrDefault("ms", "200"), 200);
+        String id = tasks.submitDelay(ms);
+        String json = "{"
+                + "\"taskId\":\"" + id + "\","
+                + "\"statusUrl\":\"/tasks/" + id + "\""
+                + "}";
+        // 202 Accepted — задача принята
+        sendJson(exchange, 202, json);
+    }
+}
+package io.rusleo.minirest.http.handlers;
+
+import com.sun.net.httpserver.HttpExchange;
+import io.rusleo.minirest.http.Route;
+import io.rusleo.minirest.tasks.Task;
+import io.rusleo.minirest.tasks.TaskService;
+import io.rusleo.minirest.util.Json;
+
+import java.io.IOException;
+import java.util.Map;
+import java.util.Optional;
+
+import static io.rusleo.minirest.http.HttpExchangeHelper.sendJson;
+
+public final class TaskByIdHandler implements Route {
+    private final TaskService tasks;
+
+    public TaskByIdHandler(TaskService tasks) {
+        this.tasks = tasks;
+    }
+
+    @Override
+    public void handle(HttpExchange exchange, Map<String, String> pathParams) throws IOException {
+        String id = pathParams.get("id");
+        Optional<Task> opt = tasks.get(id);
+        if (opt.isEmpty()) {
+            sendJson(exchange, 404, "{\"error\":\"not_found\"}");
+            return;
+        }
+        Task t = opt.get();
+        String json = "{"
+                + "\"id\":" + Json.esc(t.id()) + ","
+                + "\"type\":" + Json.esc(t.type()) + ","
+                + "\"status\":" + Json.esc(t.status().name()) + ","
+                + "\"createdAt\":" + t.createdAtEpochMs() + ","
+                + "\"startedAt\":" + (t.startedAtEpochMs() == null ? "null" : t.startedAtEpochMs()) + ","
+                + "\"finishedAt\":" + (t.finishedAtEpochMs() == null ? "null" : t.finishedAtEpochMs()) + ","
+                + "\"error\":" + (t.error() == null ? "null" : Json.esc(t.error()))
+                + "}";
+        sendJson(exchange, 200, json);
+    }
+}
+package io.rusleo.minirest.http.handlers;
+
+import com.sun.net.httpserver.HttpExchange;
+import io.rusleo.minirest.http.Route;
+import io.rusleo.minirest.tasks.Task;
+import io.rusleo.minirest.tasks.TaskService;
+import io.rusleo.minirest.tasks.TaskStatus;
+
+import java.io.IOException;
+import java.util.EnumMap;
+import java.util.Map;
+
+import static io.rusleo.minirest.http.HttpExchangeHelper.sendJson;
+
+public final class TasksStatusHandler implements Route {
+    private final TaskService tasks;
+
+    public TasksStatusHandler(TaskService tasks) {
+        this.tasks = tasks;
+    }
+
+    @Override
+    public void handle(HttpExchange exchange, Map<String, String> pathParams) throws IOException {
+        Map<String, Task> all = tasks.snapshotAll();
+        EnumMap<TaskStatus, Integer> counts = new EnumMap<>(TaskStatus.class);
+        for (TaskStatus s : TaskStatus.values()) counts.put(s, 0);
+        for (Task t : all.values()) counts.put(t.status(), counts.get(t.status()) + 1);
+
+        String json = "{"
+                + "\"running\":" + counts.get(TaskStatus.RUNNING) + ","
+                + "\"submitted\":" + counts.get(TaskStatus.SUBMITTED) + ","
+                + "\"completed\":" + counts.get(TaskStatus.COMPLETED) + ","
+                + "\"failed\":" + counts.get(TaskStatus.FAILED) + ","
+                + "\"total\":" + all.size()
+                + "}";
+        sendJson(exchange, 200, json);
+    }
+}
